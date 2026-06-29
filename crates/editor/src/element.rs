@@ -1039,13 +1039,18 @@ impl EditorElement {
                         [cursor_position.row().minus(visible_display_row_range.start) as usize];
                     let cursor_column = cursor_position.column() as usize;
 
-                    let cursor_character_x = cursor_row_layout.x_for_index(cursor_column)
-                        + cursor_row_layout
-                            .alignment_offset(self.style.text.text_align, text_hitbox.size.width);
-                    let cursor_next_x = cursor_row_layout.x_for_index(cursor_column + 1)
-                        + cursor_row_layout
-                            .alignment_offset(self.style.text.text_align, text_hitbox.size.width);
-                    let mut cell_width = cursor_next_x - cursor_character_x;
+                    // On huge lines these x coordinates exceed f32 pixel
+                    // precision, so keep them in f64 until the scroll position
+                    // cancels the magnitude.
+                    let alignment_offset = ScrollPixelOffset::from(
+                        cursor_row_layout
+                            .alignment_offset(self.style.text.text_align, text_hitbox.size.width),
+                    );
+                    let cursor_character_x =
+                        cursor_row_layout.x_for_index(cursor_column) + alignment_offset;
+                    let cursor_next_x =
+                        cursor_row_layout.x_for_index(cursor_column + 1) + alignment_offset;
+                    let mut cell_width = Pixels::from(cursor_next_x - cursor_character_x);
                     if cell_width == Pixels::ZERO {
                         cell_width = em_advance;
                     }
@@ -1114,7 +1119,7 @@ impl EditorElement {
                         }
                     }
 
-                    let x = cursor_character_x - scroll_pixel_position.x.into();
+                    let x = Pixels::from(cursor_character_x - scroll_pixel_position.x);
                     let y = ((cursor_position.row().as_f64() - scroll_position.y)
                         * ScrollPixelOffset::from(line_height))
                     .into();
@@ -1256,11 +1261,11 @@ impl EditorElement {
 
         let row_index = label_row.minus(context.visible_display_row_range.start) as usize;
         let row_layout = &context.line_layouts[row_index];
-        let label_column = label_display_point.column().min(row_layout.len as u32) as usize;
-        let label_x = row_layout.x_for_index(label_column)
-            + row_layout.alignment_offset(context.text_align, context.content_width)
-            - context.scroll_pixel_position.x.into()
-            + label.x_offset;
+        let label_column = label_display_point.column().min(row_layout.full_len as u32) as usize;
+        let label_x =
+            Pixels::from(row_layout.x_for_index(label_column) - context.scroll_pixel_position.x)
+                + row_layout.alignment_offset(context.text_align, context.content_width)
+                + label.x_offset;
         let label_y = ((label_row.as_f64() - context.scroll_position.y)
             * ScrollPixelOffset::from(context.line_height))
         .into();
@@ -1628,13 +1633,13 @@ impl EditorElement {
                 let size = element.layout_as_root(available_space, window, cx);
 
                 let line = &lines[ix];
-                let padding = if line.width == Pixels::ZERO {
+                let padding = if line.width == 0. {
                     Pixels::ZERO
                 } else {
                     4. * em_width
                 };
                 let position = point(
-                    Pixels::from(scroll_pixel_position.x) + line.width + padding,
+                    Pixels::from(scroll_pixel_position.x + line.width) + padding,
                     line_height
                         * (DisplayRow(start_row.0 + ix as u32).as_f64() - scroll_position.y) as f32,
                 );
@@ -1800,7 +1805,7 @@ impl EditorElement {
                     crease_trailer.bounds.right()
                 } else {
                     Pixels::from(
-                        ScrollPixelOffset::from(content_origin.x + line_layout.width)
+                        ScrollPixelOffset::from(content_origin.x) + line_layout.width
                             - scroll_pixel_position.x,
                     )
                 };
@@ -2064,7 +2069,7 @@ impl EditorElement {
                 crease_trailer.bounds.right()
             } else {
                 Pixels::from(
-                    ScrollPixelOffset::from(content_origin.x + line_layout.width)
+                    ScrollPixelOffset::from(content_origin.x) + line_layout.width
                         - scroll_pixel_position.x,
                 )
             };
@@ -3057,11 +3062,29 @@ impl EditorElement {
         processed_ranges
     }
 
+    /// Records inline-renderer widths measured during line layout; returns
+    /// whether any changed, requiring another prepaint pass.
+    fn update_renderer_widths(
+        &self,
+        is_minimap: bool,
+        request_layout: &EditorRequestLayoutState,
+        line_layouts: &[LineWithInvisibles],
+        cx: &mut App,
+    ) -> bool {
+        !is_minimap
+            && request_layout.has_remaining_prepaint_depth()
+            && self.editor.update(cx, |editor, cx| {
+                editor.update_renderer_widths(renderer_widths(line_layouts), cx)
+            })
+    }
+
     fn layout_lines(
         rows: Range<DisplayRow>,
         snapshot: &EditorSnapshot,
         style: &EditorStyle,
         editor_width: Pixels,
+        cell_width: Pixels,
+        byte_columns_to_shape: Option<Range<usize>>,
         is_row_soft_wrapped: impl Copy + Fn(usize) -> bool,
         bg_segments_per_row: &[Vec<(Range<DisplayPoint>, Hsla)>],
         window: &mut Window,
@@ -3102,14 +3125,37 @@ impl EditorElement {
                         None,
                     );
                     LineWithInvisibles {
-                        width: line.width,
-                        len: line.len,
+                        width: line.width.into(),
+                        full_len: line.len,
                         fragments: smallvec![LineFragment::Text(line)],
                         invisibles: Vec::new(),
                         font_size,
+                        shaped_start_index: 0,
+                        grid_cell_width: cell_width,
                     }
                 })
                 .collect()
+        } else if let Some(byte_columns) = byte_columns_to_shape {
+            let mut layouts = Vec::with_capacity(rows.len());
+            for row in rows.start.0..rows.end.0 {
+                let display_row = DisplayRow(row);
+                let row_bg = bg_segments_per_row
+                    .get((row - rows.start.0) as usize)
+                    .map(std::slice::from_ref)
+                    .unwrap_or(&[]);
+                layouts.push(layout_windowed_row(
+                    display_row,
+                    &byte_columns,
+                    snapshot,
+                    style,
+                    editor_width,
+                    cell_width,
+                    row_bg,
+                    window,
+                    cx,
+                ));
+            }
+            layouts
         } else {
             let use_tree_sitter = !snapshot.semantic_tokens_enabled
                 || snapshot.use_tree_sitter_for_syntax(rows.start, cx);
@@ -3125,6 +3171,8 @@ impl EditorElement {
                 rows.len(),
                 &snapshot.mode,
                 editor_width,
+                cell_width,
+                None,
                 is_row_soft_wrapped,
                 bg_segments_per_row,
                 window,
@@ -3176,7 +3224,7 @@ impl EditorElement {
         em_width: Pixels,
         text_hitbox: &Hitbox,
         editor_width: Pixels,
-        scroll_width: &mut Pixels,
+        scroll_width: &mut ScrollPixelOffset,
         resized_blocks: &mut HashMap<CustomBlockId, u32>,
         row_block_types: &mut HashMap<DisplayRow, bool>,
         selections: &[Selection<Point>],
@@ -3200,8 +3248,8 @@ impl EditorElement {
                 let align_to = block_start.to_display_point(snapshot);
                 let x_and_width = |layout: &LineWithInvisibles| {
                     (
-                        text_x + layout.x_for_index(align_to.column() as usize),
-                        text_x + layout.width,
+                        text_x + Pixels::from(layout.x_for_index(align_to.column() as usize)),
+                        text_x + Pixels::from(layout.width),
                     )
                 };
                 let line_ix = align_to.row().0.checked_sub(rows.start.0);
@@ -3214,6 +3262,7 @@ impl EditorElement {
                             snapshot,
                             &self.style,
                             editor_width,
+                            None,
                             is_row_soft_wrapped,
                             window,
                             cx,
@@ -3248,7 +3297,7 @@ impl EditorElement {
                             block_id,
                             height: custom.height.unwrap_or(1),
                             selected,
-                            max_width: text_hitbox.size.width.max(*scroll_width),
+                            max_width: text_hitbox.size.width.max(Pixels::from(*scroll_width)),
                             editor_style: &self.style,
                             indent_guide_padding: indent_guides
                                 .as_ref()
@@ -3502,12 +3551,12 @@ impl EditorElement {
         hitbox: &Hitbox,
         text_hitbox: &Hitbox,
         editor_width: Pixels,
-        scroll_width: &mut Pixels,
+        scroll_width: &mut ScrollPixelOffset,
         editor_margins: &EditorMargins,
         em_width: Pixels,
         text_x: Pixels,
         line_height: Pixels,
-        line_layouts: &mut [LineWithInvisibles],
+        line_layouts: &[LineWithInvisibles],
         selections: &[Selection<Point>],
         selected_buffer_ids: &Vec<BufferId>,
         latest_selection_anchors: &HashMap<BufferId, Anchor>,
@@ -3589,14 +3638,16 @@ impl EditorElement {
                     .width
                     .max(fixed_block_max_width)
                     .max(
-                        editor_margins.gutter.width + *scroll_width + editor_margins.extended_right,
+                        editor_margins.gutter.width
+                            + Pixels::from(*scroll_width)
+                            + editor_margins.extended_right,
                     )
                     .into(),
                 (BlockStyle::Spacer, _) => hitbox
                     .size
                     .width
                     .max(fixed_block_max_width)
-                    .max(*scroll_width + editor_margins.extended_right)
+                    .max(Pixels::from(*scroll_width) + editor_margins.extended_right)
                     .into(),
                 (BlockStyle::Fixed, _) => unreachable!(),
             };
@@ -3661,7 +3712,9 @@ impl EditorElement {
                 BlockStyle::Fixed => AvailableSpace::MinContent,
                 BlockStyle::Flex => {
                     AvailableSpace::Definite(hitbox.size.width.max(fixed_block_max_width).max(
-                        editor_margins.gutter.width + *scroll_width + editor_margins.extended_right,
+                        editor_margins.gutter.width
+                            + Pixels::from(*scroll_width)
+                            + editor_margins.extended_right,
                     ))
                 }
                 BlockStyle::Spacer => AvailableSpace::Definite(
@@ -3669,7 +3722,7 @@ impl EditorElement {
                         .size
                         .width
                         .max(fixed_block_max_width)
-                        .max(*scroll_width + editor_margins.extended_right),
+                        .max(Pixels::from(*scroll_width) + editor_margins.extended_right),
                 ),
                 BlockStyle::Sticky => AvailableSpace::Definite(hitbox.size.width),
             };
@@ -3715,8 +3768,9 @@ impl EditorElement {
         }
 
         if resized_blocks.is_empty() {
-            *scroll_width =
-                (*scroll_width).max(fixed_block_max_width - editor_margins.gutter.width);
+            *scroll_width = (*scroll_width).max(ScrollPixelOffset::from(
+                fixed_block_max_width - editor_margins.gutter.width,
+            ));
         }
 
         RenderBlocksOutput {
@@ -3844,9 +3898,8 @@ impl EditorElement {
                 x: cmp::max(
                     px(0.),
                     Pixels::from(
-                        ScrollPixelOffset::from(
-                            cursor_row_layout.x_for_index(cursor.column() as usize),
-                        ) - scroll_pixel_position.x,
+                        cursor_row_layout.x_for_index(cursor.column() as usize)
+                            - scroll_pixel_position.x,
                     ),
                 ),
                 y: cmp::max(
@@ -4368,8 +4421,10 @@ impl EditorElement {
             as usize];
 
         // Compute Hovered Point
-        let x = hovered_row_layout.x_for_index(popover_position.column() as usize)
-            - Pixels::from(scroll_pixel_position.x);
+        let x = Pixels::from(
+            hovered_row_layout.x_for_index(popover_position.column() as usize)
+                - scroll_pixel_position.x,
+        );
         let y = Pixels::from(
             popover_position.row().as_f64() * ScrollPixelOffset::from(line_height)
                 - scroll_pixel_position.y,
@@ -4807,8 +4862,10 @@ impl EditorElement {
             return;
         };
 
-        let target_x = cursor_row_layout.x_for_index(newest_selection_head.column() as usize)
-            - Pixels::from(scroll_pixel_position.x);
+        let target_x = Pixels::from(
+            cursor_row_layout.x_for_index(newest_selection_head.column() as usize)
+                - scroll_pixel_position.x,
+        );
         let target_y = Pixels::from(
             selection_row.as_f64() * ScrollPixelOffset::from(line_height) - scroll_pixel_position.y,
         );
@@ -6246,10 +6303,9 @@ impl EditorElement {
                             start_x: if row == range.start.row() {
                                 layout.content_origin.x
                                     + Pixels::from(
-                                        ScrollPixelOffset::from(
-                                            line_layout.x_for_index(range.start.column() as usize)
-                                                + alignment_offset,
-                                        ) - layout.position_map.scroll_pixel_position.x,
+                                        line_layout.x_for_index(range.start.column() as usize)
+                                            + ScrollPixelOffset::from(alignment_offset)
+                                            - layout.position_map.scroll_pixel_position.x,
                                     )
                             } else {
                                 layout.content_origin.x + alignment_offset
@@ -6258,19 +6314,18 @@ impl EditorElement {
                             end_x: if row == range.end.row() {
                                 layout.content_origin.x
                                     + Pixels::from(
-                                        ScrollPixelOffset::from(
-                                            line_layout.x_for_index(range.end.column() as usize)
-                                                + alignment_offset,
-                                        ) - layout.position_map.scroll_pixel_position.x,
+                                        line_layout.x_for_index(range.end.column() as usize)
+                                            + ScrollPixelOffset::from(alignment_offset)
+                                            - layout.position_map.scroll_pixel_position.x,
                                     )
                             } else {
                                 Pixels::from(
                                     ScrollPixelOffset::from(
                                         layout.content_origin.x
-                                            + line_layout.width
                                             + alignment_offset
                                             + line_end_overshoot,
-                                    ) - layout.position_map.scroll_pixel_position.x,
+                                    ) + line_layout.width
+                                        - layout.position_map.scroll_pixel_position.x,
                                 )
                             },
                         }
@@ -7039,9 +7094,11 @@ fn render_blame_entry(
 pub(crate) struct LineWithInvisibles {
     fragments: SmallVec<[LineFragment; 1]>,
     invisibles: Vec<Invisible>,
-    len: usize,
-    pub(crate) width: Pixels,
+    full_len: usize,
+    pub(crate) width: ScrollPixelOffset,
     font_size: Pixels,
+    shaped_start_index: usize,
+    grid_cell_width: Pixels,
 }
 
 enum LineFragment {
@@ -7052,6 +7109,16 @@ enum LineFragment {
         size: Size<Pixels>,
         len: usize,
     },
+}
+
+/// Describes a single display row whose chunks have been pre-limited to a
+/// horizontally visible column window (used when soft wrap is disabled).
+#[derive(Copy, Clone)]
+struct RowWindow {
+    /// Absolute byte column where the windowed chunks begin.
+    start_col: usize,
+    /// Full byte length of the display row.
+    full_len: usize,
 }
 
 impl fmt::Debug for LineFragment {
@@ -7068,6 +7135,18 @@ impl fmt::Debug for LineFragment {
 }
 
 impl LineWithInvisibles {
+    fn grid_only(full_len: usize, font_size: Pixels, cell_width: Pixels) -> Self {
+        Self {
+            fragments: SmallVec::new(),
+            invisibles: Vec::new(),
+            full_len,
+            width: ScrollPixelOffset::from(cell_width) * full_len as ScrollPixelOffset,
+            font_size,
+            shaped_start_index: 0,
+            grid_cell_width: cell_width,
+        }
+    }
+
     fn from_chunks<'a>(
         chunks: impl Iterator<Item = HighlightedChunk<'a>>,
         editor_style: &EditorStyle,
@@ -7075,19 +7154,23 @@ impl LineWithInvisibles {
         max_line_count: usize,
         editor_mode: &EditorMode,
         text_width: Pixels,
+        cell_width: Pixels,
+        // When `Some`, the provided `chunks` are already limited to the visible
+        // column window of a single row (soft wrap disabled), starting at
+        // `start_col`. The resulting line reports the row's `full_len` so that
+        // columns outside the shaped window are still addressable.
+        row_window: Option<RowWindow>,
         is_row_soft_wrapped: impl Copy + Fn(usize) -> bool,
         bg_segments_per_row: &[Vec<(Range<DisplayPoint>, Hsla)>],
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<Self> {
         let text_style = &editor_style.text;
+        let col_base = row_window.as_ref().map_or(0, |w| w.start_col);
         let mut layouts = Vec::with_capacity(max_line_count);
         let mut fragments: SmallVec<[LineFragment; 1]> = SmallVec::new();
         let mut line = String::new();
-        // Byte offset into the logical line used to position invisible markers.
-        // Unlike `line`, this is not cleared when we flush `shape_line` for
-        // mid-line inlays/replacements, so marker offsets stay correct in that case.
-        let mut line_byte_offset: usize = 0;
+        let mut line_byte_offset: usize = col_base;
         let mut invisibles = Vec::new();
         let mut width = Pixels::ZERO;
         let mut len = 0;
@@ -7112,7 +7195,9 @@ impl LineWithInvisibles {
                     continue;
                 }
 
-                if len + line.len() + highlighted_chunk.text.len() > max_line_len {
+                if row_window.is_none()
+                    && len + line.len() + highlighted_chunk.text.len() > max_line_len
+                {
                     line_exceeded_max_len = true;
                     continue;
                 }
@@ -7122,7 +7207,12 @@ impl LineWithInvisibles {
                     let text_runs: &[TextRun] = if segments.is_empty() {
                         &styles
                     } else {
-                        &Self::split_runs_by_bg_segments(&styles, segments, min_contrast, len)
+                        &Self::split_runs_by_bg_segments(
+                            &styles,
+                            segments,
+                            min_contrast,
+                            col_base + len,
+                        )
                     };
                     let shaped_line = window.text_system().shape_line(
                         line.as_str().into(),
@@ -7211,7 +7301,12 @@ impl LineWithInvisibles {
                         let text_runs = if segments.is_empty() {
                             &styles
                         } else {
-                            &Self::split_runs_by_bg_segments(&styles, segments, min_contrast, len)
+                            &Self::split_runs_by_bg_segments(
+                                &styles,
+                                segments,
+                                min_contrast,
+                                col_base + len,
+                            )
                         };
                         let shaped_line = window.text_system().shape_line(
                             line.clone().into(),
@@ -7222,16 +7317,30 @@ impl LineWithInvisibles {
                         width += shaped_line.width;
                         len += shaped_line.len;
                         fragments.push(LineFragment::Text(shaped_line));
+                        // The monospace-grid width is only needed when part
+                        // of the row is outside the shaped window; a fully
+                        // covered row keeps its exact shaped width.
+                        let row_width = match row_window.as_ref() {
+                            Some(w) if col_base > 0 || len != w.full_len => {
+                                ScrollPixelOffset::from(cell_width)
+                                    * w.full_len as ScrollPixelOffset
+                            }
+                            _ => ScrollPixelOffset::from(width),
+                        };
                         layouts.push(Self {
-                            width: mem::take(&mut width),
-                            len: mem::take(&mut len),
+                            width: row_width,
+                            full_len: row_window.as_ref().map_or(len, |w| w.full_len),
                             fragments: mem::take(&mut fragments),
-                            invisibles: std::mem::take(&mut invisibles),
+                            invisibles: mem::take(&mut invisibles),
                             font_size,
+                            shaped_start_index: col_base,
+                            grid_cell_width: cell_width,
                         });
 
                         line.clear();
-                        line_byte_offset = 0;
+                        line_byte_offset = col_base;
+                        width = Pixels::ZERO;
+                        len = 0;
                         styles.clear();
                         row += 1;
                         line_exceeded_max_len = false;
@@ -7248,18 +7357,20 @@ impl LineWithInvisibles {
                             Cow::Borrowed(text_style)
                         };
 
-                        let current_line_len = len + line.len();
-                        if current_line_len + line_chunk.len() > max_line_len {
-                            let mut chunk_len = max_line_len - current_line_len;
-                            while !line_chunk.is_char_boundary(chunk_len) {
-                                chunk_len -= 1;
+                        if row_window.is_none() {
+                            let current_line_len = len + line.len();
+                            if current_line_len + line_chunk.len() > max_line_len {
+                                let mut chunk_len = max_line_len - current_line_len;
+                                while !line_chunk.is_char_boundary(chunk_len) {
+                                    chunk_len -= 1;
+                                }
+                                line_chunk = &line_chunk[..chunk_len];
+                                line_exceeded_max_len = true;
                             }
-                            line_chunk = &line_chunk[..chunk_len];
-                            line_exceeded_max_len = true;
-                        }
 
-                        if line_chunk.is_empty() {
-                            continue;
+                            if line_chunk.is_empty() {
+                                continue;
+                            }
                         }
 
                         styles.push(TextRun {
@@ -7424,7 +7535,7 @@ impl LineWithInvisibles {
         cx: &mut App,
     ) {
         let mut fragment_origin =
-            content_origin + gpui::point(Pixels::from(-scroll_pixel_position.x), line_y);
+            content_origin + gpui::point(self.scrolled_start_x(scroll_pixel_position.x), line_y);
         for fragment in &mut self.fragments {
             match fragment {
                 LineFragment::Text(line) => {
@@ -7484,7 +7595,7 @@ impl LineWithInvisibles {
         let line_height = layout.position_map.line_height;
         let mut fragment_origin = content_origin
             + gpui::point(
-                Pixels::from(-layout.position_map.scroll_pixel_position.x),
+                self.scrolled_start_x(layout.position_map.scroll_pixel_position.x),
                 line_y,
             );
 
@@ -7534,7 +7645,7 @@ impl LineWithInvisibles {
 
         let mut fragment_origin = content_origin
             + gpui::point(
-                Pixels::from(-layout.position_map.scroll_pixel_position.x),
+                self.scrolled_start_x(layout.position_map.scroll_pixel_position.x),
                 line_y,
             );
 
@@ -7590,14 +7701,14 @@ impl LineWithInvisibles {
             let token_x = self.x_for_index(token_offset);
             // Center the marker inside the actual glyph's width so it lines up with
             // proportional fonts instead of assuming a monospace `em_width` cell.
-            let glyph_width = (self.x_for_index(token_end_offset) - token_x).max(Pixels::ZERO);
-            let x_offset: ScrollPixelOffset = token_x.into();
+            let glyph_width =
+                Pixels::from(self.x_for_index(token_end_offset) - token_x).max(Pixels::ZERO);
             let invisible_offset: ScrollPixelOffset =
                 ((glyph_width - invisible_symbol.width).max(Pixels::ZERO) / 2.0).into();
             let origin = content_origin
                 + gpui::point(
                     Pixels::from(
-                        x_offset + invisible_offset - layout.position_map.scroll_pixel_position.x,
+                        token_x + invisible_offset - layout.position_map.scroll_pixel_position.x,
                     ),
                     line_y,
                 );
@@ -7629,7 +7740,7 @@ impl LineWithInvisibles {
             }),
 
             ShowWhitespaceSetting::Trailing => {
-                let mut previous_start = self.len;
+                let mut previous_start = self.full_len;
                 for ([start, end], paint) in invisible_iter.rev() {
                     if previous_start != end {
                         break;
@@ -7657,7 +7768,7 @@ impl LineWithInvisibles {
                         _ => false,
                     };
 
-                    if should_render || start == 0 || end == self.len {
+                    if should_render || start == 0 || end == self.full_len {
                         paint(window, cx);
 
                         // Since we are scanning from the left, we will skip over the first available whitespace that is part
@@ -7684,9 +7795,38 @@ impl LineWithInvisibles {
         }
     }
 
-    pub fn x_for_index(&self, index: usize) -> Pixels {
-        let mut fragment_start_x = Pixels::ZERO;
-        let mut fragment_start_index = 0;
+    fn start_x(&self) -> ScrollPixelOffset {
+        ScrollPixelOffset::from(self.grid_cell_width) * self.shaped_start_index as ScrollPixelOffset
+    }
+
+    fn scrolled_start_x(&self, scroll_x: ScrollPixelOffset) -> Pixels {
+        Pixels::from(self.start_x() - scroll_x)
+    }
+
+    fn shaped_len(&self) -> usize {
+        self.fragments
+            .iter()
+            .map(|fragment| match fragment {
+                LineFragment::Text(shaped_line) => shaped_line.len,
+                LineFragment::Element { len, .. } => *len,
+            })
+            .sum()
+    }
+
+    /// Whether `index` lies outside the shaped window, meaning it was derived
+    /// from monospace-grid rounding and may not be a character boundary.
+    pub fn is_grid_positioned_index(&self, index: usize) -> bool {
+        index < self.shaped_start_index || index > self.shaped_start_index + self.shaped_len()
+    }
+
+    pub fn x_for_index(&self, index: usize) -> ScrollPixelOffset {
+        let cell_width = ScrollPixelOffset::from(self.grid_cell_width);
+        // Columns before the shaped window are positioned on the monospace grid.
+        if index < self.shaped_start_index {
+            return cell_width * index as ScrollPixelOffset;
+        }
+        let mut fragment_start_x = self.start_x();
+        let mut fragment_start_index = self.shaped_start_index;
 
         for fragment in &self.fragments {
             match fragment {
@@ -7694,9 +7834,11 @@ impl LineWithInvisibles {
                     let fragment_end_index = fragment_start_index + shaped_line.len;
                     if index < fragment_end_index {
                         return fragment_start_x
-                            + shaped_line.x_for_index(index - fragment_start_index);
+                            + ScrollPixelOffset::from(
+                                shaped_line.x_for_index(index - fragment_start_index),
+                            );
                     }
-                    fragment_start_x += shaped_line.width;
+                    fragment_start_x += ScrollPixelOffset::from(shaped_line.width);
                     fragment_start_index = fragment_end_index;
                 }
                 LineFragment::Element { len, size, .. } => {
@@ -7704,35 +7846,54 @@ impl LineWithInvisibles {
                     if index < fragment_end_index {
                         return fragment_start_x;
                     }
-                    fragment_start_x += size.width;
+                    fragment_start_x += ScrollPixelOffset::from(size.width);
                     fragment_start_index = fragment_end_index;
                 }
             }
         }
 
-        fragment_start_x
+        // Columns past the shaped window are positioned on the monospace grid.
+        if fragment_start_index < self.full_len {
+            fragment_start_x
+                + cell_width
+                    * (index.min(self.full_len) - fragment_start_index) as ScrollPixelOffset
+        } else {
+            fragment_start_x
+        }
     }
 
-    pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
-        let mut fragment_start_x = Pixels::ZERO;
-        let mut fragment_start_index = 0;
+    pub fn index_for_x(&self, x: ScrollPixelOffset) -> Option<IndexForX> {
+        let cell_width = ScrollPixelOffset::from(self.grid_cell_width);
+        // Columns before the shaped window sit on the monospace grid; round to
+        // the nearest cell to match `display_column_for_x`.
+        if self.shaped_start_index > 0 && x < self.start_x() {
+            if cell_width <= 0. {
+                return Some(self.classify_index(0));
+            }
+            let column = ((x / cell_width).round().max(0.) as usize).min(self.shaped_start_index);
+            return Some(self.classify_index(column));
+        }
+        let mut fragment_start_x = self.start_x();
+        let mut fragment_start_index = self.shaped_start_index;
 
         for fragment in &self.fragments {
             match fragment {
                 LineFragment::Text(shaped_line) => {
-                    let fragment_end_x = fragment_start_x + shaped_line.width;
+                    let fragment_end_x =
+                        fragment_start_x + ScrollPixelOffset::from(shaped_line.width);
                     if x < fragment_end_x {
-                        return Some(
-                            fragment_start_index + shaped_line.index_for_x(x - fragment_start_x)?,
-                        );
+                        return Some(IndexForX::Shaped(
+                            fragment_start_index
+                                + shaped_line.index_for_x(Pixels::from(x - fragment_start_x))?,
+                        ));
                     }
                     fragment_start_x = fragment_end_x;
                     fragment_start_index += shaped_line.len;
                 }
                 LineFragment::Element { len, size, .. } => {
-                    let fragment_end_x = fragment_start_x + size.width;
+                    let fragment_end_x = fragment_start_x + ScrollPixelOffset::from(size.width);
                     if x < fragment_end_x {
-                        return Some(fragment_start_index);
+                        return Some(IndexForX::Shaped(fragment_start_index));
                     }
                     fragment_start_index += len;
                     fragment_start_x = fragment_end_x;
@@ -7740,11 +7901,32 @@ impl LineWithInvisibles {
             }
         }
 
-        None
+        // For windowed rows there is more content to the right of the shaped
+        // region; map past-window positions onto the monospace grid. Past the
+        // end of the row, return `None` so `point_for_position` computes the
+        // column overshoot, as it does for fully shaped rows.
+        if fragment_start_index < self.full_len && cell_width > 0. {
+            let column = fragment_start_index
+                .saturating_add(((x - fragment_start_x) / cell_width).round().max(0.) as usize);
+            (column <= self.full_len).then(|| self.classify_index(column))
+        } else {
+            None
+        }
+    }
+
+    fn classify_index(&self, index: usize) -> IndexForX {
+        if self.is_grid_positioned_index(index) {
+            IndexForX::GridApproximation(index)
+        } else {
+            IndexForX::Shaped(index)
+        }
     }
 
     pub fn font_id_for_index(&self, index: usize) -> Option<FontId> {
-        let mut fragment_start_index = 0;
+        if index < self.shaped_start_index {
+            return None;
+        }
+        let mut fragment_start_index = self.shaped_start_index;
 
         for fragment in &self.fragments {
             match fragment {
@@ -7769,13 +7951,23 @@ impl LineWithInvisibles {
     }
 
     pub fn alignment_offset(&self, text_align: TextAlign, content_width: Pixels) -> Pixels {
-        let line_width = self.width;
+        let line_width = Pixels::from(self.width);
         match text_align {
             TextAlign::Left => px(0.0),
             TextAlign::Center => (content_width - line_width) / 2.0,
             TextAlign::Right => content_width - line_width,
         }
     }
+}
+
+/// A byte index within a display row, resolved from an x coordinate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexForX {
+    /// Resolved against shaped glyphs; lies on a character boundary.
+    Shaped(usize),
+    /// Approximated on the monospace grid outside the shaped window; may not
+    /// lie on a character boundary.
+    GridApproximation(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8563,35 +8755,63 @@ impl Element for EditorElement {
                         self.style.background,
                     );
 
+                    // When soft wrap is disabled, a logical line becomes a single
+                    // display row that can be arbitrarily long. Shape only the
+                    // horizontally visible byte-column range (plus overscan) so
+                    // rendering cost is independent of line length. This applies
+                    // to every editor mode, including the minimap (never wraps,
+                    // only a few columns wide) and single-line/auto-height
+                    // editors (arbitrary pasted content).
+                    let non_wrapping = self.editor.read(cx).soft_wrap_mode(cx) == SoftWrap::None;
+                    let visible_cols = visible_columns(editor_width, em_layout_width);
+                    // Only engage per-row windowing when a visible row exceeds the
+                    // batched path's per-row cap (`MAX_LINE_LEN`). Below that, the
+                    // batched path both renders the row fully and is cheap, so
+                    // normal files (and the minimap on them) are unaffected and
+                    // avoid the per-row fetch overhead.
+                    //
+                    // `longest_row_in_range` is a single tree query, but it tracks
+                    // chars while rows overflow by *byte* length, and a row's byte
+                    // length is between 1x and 4x its char count. The two checks on
+                    // the longest visible row therefore decide all cases outside
+                    // that ambiguity band; only within it (longest visible row
+                    // between `MAX_LINE_LEN / 4` and `MAX_LINE_LEN` bytes) does the
+                    // per-visible-row scan run, which the minimap would otherwise
+                    // pay for thousands of rows every frame.
+                    // The `has_soft_wraps` check covers mode transitions where
+                    // the snapshot still contains wrap transforms: windowed
+                    // chunk fetching does not clip the synthetic soft-wrap
+                    // indentation by column, so it must not see wrapped rows.
+                    let has_overflowing_row = non_wrapping
+                        && !snapshot.has_soft_wraps()
+                        && !em_layout_width.is_zero()
+                        && start_row < end_row
+                        && {
+                            let longest_visible_len = snapshot
+                                .line_len(snapshot.longest_row_in_range(start_row..end_row))
+                                as usize;
+                            longest_visible_len > MAX_LINE_LEN
+                                || (longest_visible_len > MAX_LINE_LEN / 4
+                                    && (start_row.0..end_row.0).any(|row| {
+                                        snapshot.line_len(DisplayRow(row)) as usize > MAX_LINE_LEN
+                                    }))
+                        };
+                    let shaped_byte_columns = has_overflowing_row
+                        .then(|| byte_columns_to_shape(scroll_position.x, visible_cols));
+
                     let mut line_layouts = Self::layout_lines(
                         start_row..end_row,
                         &snapshot,
                         &self.style,
                         editor_width,
+                        em_layout_width,
+                        shaped_byte_columns.clone(),
                         is_row_soft_wrapped,
                         &bg_segments_per_row,
                         window,
                         cx,
                     );
-                    let new_renderer_widths = (!is_minimap).then(|| {
-                        line_layouts
-                            .iter()
-                            .flat_map(|layout| &layout.fragments)
-                            .filter_map(|fragment| {
-                                if let LineFragment::Element { id, size, .. } = fragment {
-                                    Some((*id, size.width))
-                                } else {
-                                    None
-                                }
-                            })
-                    });
-                    let renderer_widths_changed = request_layout.has_remaining_prepaint_depth()
-                        && new_renderer_widths.is_some_and(|new_renderer_widths| {
-                            self.editor.update(cx, |editor, cx| {
-                                editor.update_renderer_widths(new_renderer_widths, cx)
-                            })
-                        });
-                    if renderer_widths_changed {
+                    if self.update_renderer_widths(is_minimap, request_layout, &line_layouts, cx) {
                         return self.prepaint(
                             None,
                             _inspector_id,
@@ -8637,11 +8857,16 @@ impl Element for EditorElement {
                         })
                         .unwrap_or(Pixels::ZERO);
 
+                    // `layout_line` positions rows longer than `MAX_LINE_LEN` on
+                    // the monospace grid instead of shaping them, so this stays
+                    // cheap for arbitrarily long rows while shorter rows keep
+                    // their shaped (proportional-font-accurate) width.
                     let longest_line_width = layout_line(
                         snapshot.longest_row(),
                         &snapshot,
                         style,
                         editor_width,
+                        None,
                         is_row_soft_wrapped,
                         window,
                         cx,
@@ -8652,7 +8877,7 @@ impl Element for EditorElement {
                         text_hitbox.bounds,
                         glyph_grid_cell,
                         size(
-                            longest_line_width,
+                            Pixels::from(longest_line_width),
                             Pixels::from(max_row.as_f64() * f64::from(line_height)),
                         ),
                         longest_line_blame_width,
@@ -8660,7 +8885,8 @@ impl Element for EditorElement {
                         scroll_beyond_last_line,
                     );
 
-                    let mut scroll_width = scrollbar_layout_information.scroll_range.width;
+                    let mut scroll_width =
+                        longest_line_width + ScrollPixelOffset::from(longest_line_blame_width);
 
                     let sticky_header_excerpt = if snapshot.buffer_snapshot().show_headers() {
                         snapshot.sticky_header_excerpt(scroll_position.y)
@@ -8705,7 +8931,7 @@ impl Element for EditorElement {
                                     em_width,
                                     gutter_dimensions.full_width(),
                                     line_height,
-                                    &mut line_layouts,
+                                    &line_layouts,
                                     &local_selections,
                                     &selected_buffer_ids,
                                     &latest_selection_anchors,
@@ -8772,9 +8998,9 @@ impl Element for EditorElement {
                     };
 
                     let scroll_max: gpui::Point<ScrollPixelOffset> = point(
-                        ScrollPixelOffset::from(
-                            ((scroll_width - editor_width) / em_layout_width).max(0.0),
-                        ),
+                        ((scroll_width - ScrollPixelOffset::from(editor_width))
+                            / ScrollPixelOffset::from(em_layout_width))
+                        .max(0.0),
                         max_scroll_top,
                     );
 
@@ -8798,6 +9024,46 @@ impl Element for EditorElement {
                             scroll_position.x = new_scroll_position.x;
                         }
                     });
+
+                    // Clamping and horizontal autoscroll can move the scroll
+                    // position after the lines were laid out. If that jump
+                    // leaves the quantized shape window (e.g. jumping to a
+                    // search match far to the right on a huge line), the shaped
+                    // glyphs would all be off-screen for a frame. The clamped
+                    // and autoscrolled position is persisted in the scroll
+                    // manager, so run another prepaint pass, which re-shapes
+                    // the lines and everything derived from them (block
+                    // alignment, renderer widths) for the final position. If
+                    // the depth limit is reached, re-shape just the lines so
+                    // the visible text is still rendered.
+                    if let Some(previous_byte_columns) = &shaped_byte_columns {
+                        let updated_byte_columns =
+                            byte_columns_to_shape(scroll_position.x, visible_cols);
+                        if updated_byte_columns != *previous_byte_columns {
+                            if request_layout.has_remaining_prepaint_depth() {
+                                return self.prepaint(
+                                    None,
+                                    _inspector_id,
+                                    bounds,
+                                    request_layout,
+                                    window,
+                                    cx,
+                                );
+                            }
+                            line_layouts = Self::layout_lines(
+                                start_row..end_row,
+                                &snapshot,
+                                &self.style,
+                                editor_width,
+                                em_layout_width,
+                                Some(updated_byte_columns),
+                                is_row_soft_wrapped,
+                                &bg_segments_per_row,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
 
                     if !em_layout_width.is_zero() {
                         scroll_position.x = window
@@ -10178,48 +10444,15 @@ impl PositionMap {
         let scroll_position = self.scroll_position;
         let position = position - text_bounds.origin;
         let y = position.y.max(px(0.)).min(self.size.height);
-        let x = position.x + (scroll_position.x as f32 * self.em_layout_width);
+        // On huge lines x exceeds f32 pixel precision, so keep it in f64.
+        let x = ScrollPixelOffset::from(position.x)
+            + scroll_position.x * ScrollPixelOffset::from(self.em_layout_width);
         let row = ((y / self.line_height) as f64 + scroll_position.y) as u32;
 
-        let (column, x_overshoot_after_line_end) = if let Some(line_index) =
-            row.checked_sub(self.visible_row_range.start.0)
-            && let Some(line) = self.line_layouts.get(line_index as usize)
-        {
-            let alignment_offset = line.alignment_offset(self.text_align, self.content_width);
-            let x_relative_to_text = x - alignment_offset;
-            if let Some(ix) = line.index_for_x(x_relative_to_text) {
-                (ix as u32, px(0.))
-            } else {
-                (line.len as u32, px(0.).max(x_relative_to_text - line.width))
-            }
-        } else {
-            (0, x)
-        };
-
-        let mut exact_unclipped = DisplayPoint::new(DisplayRow(row), column);
-        let previous_valid = self.snapshot.clip_point(exact_unclipped, Bias::Left);
-        let next_valid = self.snapshot.clip_point(exact_unclipped, Bias::Right);
-
-        let nearest_valid = if previous_valid == next_valid {
-            previous_valid
-        } else {
-            match self.snapshot.inlay_bias_at(exact_unclipped) {
-                Some(Bias::Left) => next_valid,
-                Some(Bias::Right) => previous_valid,
-                None => previous_valid,
-            }
-        };
-
-        let column_overshoot_after_line_end =
-            (x_overshoot_after_line_end / self.em_layout_width) as u32;
-        *exact_unclipped.column_mut() += column_overshoot_after_line_end;
-        PointForPosition {
-            previous_valid,
-            next_valid,
-            nearest_valid,
-            exact_unclipped,
-            column_overshoot_after_line_end,
-        }
+        let line = row
+            .checked_sub(self.visible_row_range.start.0)
+            .and_then(|line_index| self.line_layouts.get(line_index as usize));
+        self.resolve_point_for_position(DisplayRow(row), x, line)
     }
 
     fn point_for_position_on_line(
@@ -10231,20 +10464,67 @@ impl PositionMap {
         let text_bounds = self.text_hitbox.bounds;
         let scroll_position = self.scroll_position;
         let position = position - text_bounds.origin;
-        let x = position.x + (scroll_position.x as f32 * self.em_layout_width);
+        // On huge lines x exceeds f32 pixel precision, so keep it in f64.
+        let x = ScrollPixelOffset::from(position.x)
+            + scroll_position.x * ScrollPixelOffset::from(self.em_layout_width);
 
-        let alignment_offset = line.alignment_offset(self.text_align, self.content_width);
-        let x_relative_to_text = x - alignment_offset;
-        let (column, x_overshoot_after_line_end) =
-            if let Some(ix) = line.index_for_x(x_relative_to_text) {
-                (ix as u32, px(0.))
+        self.resolve_point_for_position(row, x, Some(line))
+    }
+
+    fn resolve_point_for_position(
+        &self,
+        row: DisplayRow,
+        x: ScrollPixelOffset,
+        line: Option<&LineWithInvisibles>,
+    ) -> PointForPosition {
+        let line = line.map(|line| {
+            let alignment_offset = line.alignment_offset(self.text_align, self.content_width);
+            (line, x - ScrollPixelOffset::from(alignment_offset))
+        });
+        let (column, x_overshoot_after_line_end, column_may_split_char) =
+            if let Some((line, x_relative_to_text)) = line {
+                match line.index_for_x(x_relative_to_text) {
+                    Some(IndexForX::Shaped(ix)) => (ix as u32, px(0.), false),
+                    Some(IndexForX::GridApproximation(ix)) => {
+                        (ix as u32, px(0.), ix < line.full_len)
+                    }
+                    None => (
+                        line.full_len as u32,
+                        px(0.).max(Pixels::from(
+                            x_relative_to_text - line.x_for_index(line.full_len),
+                        )),
+                        false,
+                    ),
+                }
             } else {
-                (line.len as u32, px(0.).max(x_relative_to_text - line.width))
+                (0, Pixels::from(x), false)
             };
 
         let mut exact_unclipped = DisplayPoint::new(row, column);
-        let previous_valid = self.snapshot.clip_point(exact_unclipped, Bias::Left);
-        let next_valid = self.snapshot.clip_point(exact_unclipped, Bias::Right);
+        let mut previous_valid = self.snapshot.clip_point(exact_unclipped, Bias::Left);
+        let mut next_valid = self.snapshot.clip_point(exact_unclipped, Bias::Right);
+
+        // Grid-derived columns may split a multi-byte character; snap to the
+        // nearest of its boundaries (matching `RowLayout::closest_index_for_x`)
+        // so downstream offset conversions receive a valid position.
+        if column_may_split_char
+            && previous_valid.row() == exact_unclipped.row()
+            && next_valid.row() == exact_unclipped.row()
+            && let Some((line, x_relative_to_text)) = line
+        {
+            let left = previous_valid.column();
+            let right = next_valid.column();
+            let column = if x_relative_to_text - line.x_for_index(left as usize)
+                <= line.x_for_index(right as usize) - x_relative_to_text
+            {
+                left
+            } else {
+                right
+            };
+            *exact_unclipped.column_mut() = column;
+            previous_valid = exact_unclipped;
+            next_valid = exact_unclipped;
+        }
 
         let nearest_valid = if previous_valid == next_valid {
             previous_valid
@@ -10280,11 +10560,131 @@ pub(crate) struct BlockLayout {
     pub(crate) is_buffer_header: bool,
 }
 
+fn renderer_widths(
+    line_layouts: &[LineWithInvisibles],
+) -> impl Iterator<Item = (ChunkRendererId, Pixels)> + '_ {
+    line_layouts
+        .iter()
+        .flat_map(|layout| &layout.fragments)
+        .filter_map(|fragment| match fragment {
+            LineFragment::Element { id, size, .. } => Some((*id, size.width)),
+            LineFragment::Text(_) => None,
+        })
+}
+
+/// Number of column cells that fit in the editor's visible width.
+fn visible_columns(editor_width: Pixels, cell_width: Pixels) -> usize {
+    if cell_width <= Pixels::ZERO {
+        return 1;
+    }
+    ((f64::from(editor_width / cell_width)).ceil() as usize).max(1)
+}
+
+/// Returns the quantized byte-column range to shape when soft wrap is disabled:
+/// the viewport-sized block containing `scroll_x` plus at least one block of
+/// overscan on each side. Quantized so the shaped strings stay identical across
+/// frames, keeping the shape cache warm while scrolling.
+fn byte_columns_to_shape(scroll_x: ScrollOffset, visible_cols: usize) -> Range<usize> {
+    let block = (scroll_x.max(0.).floor() as usize) / visible_cols;
+    let start = block.saturating_sub(1).saturating_mul(visible_cols);
+    start..start.saturating_add(visible_cols.saturating_mul(4))
+}
+
+/// Lays out a single display row, shaping only the `byte_columns` range so
+/// cost is independent of the row's full length (used when soft wrap is
+/// disabled).
+fn layout_windowed_row(
+    display_row: DisplayRow,
+    byte_columns: &Range<usize>,
+    snapshot: &EditorSnapshot,
+    style: &EditorStyle,
+    editor_width: Pixels,
+    cell_width: Pixels,
+    row_bg: &[Vec<(Range<DisplayPoint>, Hsla)>],
+    window: &mut Window,
+    cx: &mut App,
+) -> LineWithInvisibles {
+    let use_tree_sitter =
+        !snapshot.semantic_tokens_enabled || snapshot.use_tree_sitter_for_syntax(display_row, cx);
+    let language_aware = LanguageAwareStyling {
+        tree_sitter: use_tree_sitter,
+        diagnostics: true,
+    };
+    let mut layouts = if snapshot.is_block_line(display_row) {
+        let chunks = snapshot.highlighted_chunks(
+            display_row..display_row + DisplayRow(1),
+            language_aware,
+            style,
+        );
+        LineWithInvisibles::from_chunks(
+            chunks,
+            style,
+            MAX_LINE_LEN,
+            1,
+            &snapshot.mode,
+            editor_width,
+            cell_width,
+            None,
+            |_| false,
+            row_bg,
+            window,
+            cx,
+        )
+    } else {
+        let full_len = snapshot.line_len(display_row) as usize;
+        // The window is in cell units and may split a multi-byte character.
+        let start_col = snapshot
+            .clip_point(
+                DisplayPoint::new(display_row, byte_columns.start.min(full_len) as u32),
+                Bias::Left,
+            )
+            .column() as usize;
+        let end_col = snapshot
+            .clip_point(
+                DisplayPoint::new(display_row, byte_columns.end.min(full_len) as u32),
+                Bias::Right,
+            )
+            .column() as usize;
+        let chunks = snapshot.highlighted_chunks_in_range(
+            DisplayPoint::new(display_row, start_col as u32)
+                ..DisplayPoint::new(display_row, end_col as u32),
+            language_aware,
+            style,
+        );
+        LineWithInvisibles::from_chunks(
+            chunks,
+            style,
+            MAX_LINE_LEN,
+            1,
+            &snapshot.mode,
+            editor_width,
+            cell_width,
+            Some(RowWindow {
+                start_col,
+                full_len,
+            }),
+            |_| false,
+            row_bg,
+            window,
+            cx,
+        )
+    };
+    layouts.pop().unwrap_or_else(|| {
+        debug_panic!("from_chunks always yields at least one layout");
+        LineWithInvisibles::grid_only(
+            snapshot.line_len(display_row) as usize,
+            style.text.font_size.to_pixels(window.rem_size()),
+            cell_width,
+        )
+    })
+}
+
 pub fn layout_line(
     row: DisplayRow,
     snapshot: &EditorSnapshot,
     style: &EditorStyle,
     text_width: Pixels,
+    byte_columns_to_shape: Option<Range<usize>>,
     is_row_soft_wrapped: impl Copy + Fn(usize) -> bool,
     window: &mut Window,
     cx: &mut App,
@@ -10295,6 +10695,32 @@ pub fn layout_line(
         tree_sitter: use_tree_sitter,
         diagnostics: true,
     };
+    let font_id = window.text_system().resolve_font(&style.text.font());
+    let font_size = style.text.font_size.to_pixels(window.rem_size());
+    let cell_width = window.text_system().em_layout_width(font_id, font_size);
+    // A non-wrapping row can be arbitrarily long; shaping it whole is O(line
+    // length). Shape the requested window if the caller provided one, otherwise
+    // skip shaping entirely and rely on the monospace fallback. With soft wraps
+    // present rows are bounded by the wrap width, so shaping whole rows stays
+    // cheap, and windowed chunk fetching would not clip the synthetic
+    // soft-wrap indentation by column.
+    let full_len = snapshot.line_len(row) as usize;
+    if full_len > MAX_LINE_LEN && !snapshot.is_block_line(row) && !snapshot.has_soft_wraps() {
+        return match byte_columns_to_shape {
+            Some(byte_columns) => layout_windowed_row(
+                row,
+                &byte_columns,
+                snapshot,
+                style,
+                text_width,
+                cell_width,
+                &[],
+                window,
+                cx,
+            ),
+            None => LineWithInvisibles::grid_only(full_len, font_size, cell_width),
+        };
+    }
     let chunks = snapshot.highlighted_chunks(row..row + DisplayRow(1), language_aware, style);
     LineWithInvisibles::from_chunks(
         chunks,
@@ -10303,6 +10729,8 @@ pub fn layout_line(
         1,
         &snapshot.mode,
         text_width,
+        cell_width,
+        None,
         is_row_soft_wrapped,
         &[],
         window,
@@ -10663,8 +11091,7 @@ fn calculate_wrap_width(
     let wrap_width_for = |column: u32| (column as f32 * em_width).ceil();
 
     match soft_wrap {
-        SoftWrap::GitDiff => None,
-        SoftWrap::None => Some(wrap_width_for(MAX_LINE_LEN as u32 / 2)),
+        SoftWrap::None => None,
         SoftWrap::EditorWidth => Some(editor_width),
         SoftWrap::Bounded(column) => Some(editor_width.min(wrap_width_for(column))),
     }
@@ -10706,7 +11133,7 @@ fn compute_auto_height_layout(
     let editor_width = text_width - gutter_dimensions.margin - overscroll.width - em_width;
     let wrap_width = calculate_wrap_width(editor.soft_wrap_mode(cx), editor_width, em_width)
         .map(|width| width.min(editor_width));
-    if wrap_width.is_some() && editor.set_wrap_width(wrap_width, cx) {
+    if editor.set_wrap_width(wrap_width, cx) {
         snapshot = editor.snapshot(window, cx);
     }
 
@@ -10729,8 +11156,9 @@ fn compute_auto_height_layout(
 mod tests {
     use super::*;
     use crate::{
-        Editor, FoldPlaceholder, HighlightKey, Inlay, MultiBuffer, NavigationOverlayKey,
-        NavigationOverlayLabel, NavigationTargetOverlay, SelectionEffects,
+        Autoscroll, Editor, FoldPlaceholder, HighlightKey, Inlay, MultiBuffer,
+        NavigationOverlayKey, NavigationOverlayLabel, NavigationTargetOverlay, SelectionEffects,
+        ToggleSoftWrap,
         display_map::{BlockPlacement, BlockProperties, DisplayMap},
         editor_tests::{init_test, update_test_language_settings},
     };
@@ -11234,11 +11662,11 @@ mod tests {
         // click at the end of the second line
         let target_point = DisplayPoint::new(DisplayRow(1), 3);
         let click_x = state.content_origin.x
-            + editor.update_in(cx, |editor, window, cx| {
+            + Pixels::from(editor.update_in(cx, |editor, window, cx| {
                 editor
                     .snapshot(window, cx)
                     .x_for_display_point(target_point, &editor.text_layout_details(window, cx))
-            });
+            }));
 
         let point = state
             .position_map
@@ -11955,6 +12383,8 @@ mod tests {
                     1,
                     &editor_mode,
                     px(500.),
+                    px(10.),
+                    None,
                     |_| false,
                     &[],
                     window,
@@ -11962,10 +12392,373 @@ mod tests {
                 );
 
                 assert_eq!(layouts.len(), 1);
-                assert_eq!(layouts[0].len, max_line_len);
+                assert_eq!(layouts[0].full_len, max_line_len);
                 assert!(layouts[0].fragments.len() <= max_line_len);
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_row_window_shapes_only_visible_columns(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let editor = window.root(cx).unwrap();
+        let style = cx.update(|_, cx| editor.update(cx, |editor, cx| editor.style(cx).clone()));
+        let editor_mode = EditorMode::full();
+        let cell_width = px(10.);
+        // The window-clipped chunks the caller would fetch for columns 100..200.
+        let windowed = "a".repeat(100);
+
+        window
+            .update(cx, |_, window, cx| {
+                let chunks = std::iter::once(HighlightedChunk {
+                    text: &windowed,
+                    style: None,
+                    is_tab: false,
+                    is_inlay: false,
+                    replacement: None,
+                });
+
+                let layouts = LineWithInvisibles::from_chunks(
+                    chunks,
+                    &style,
+                    usize::MAX,
+                    1,
+                    &editor_mode,
+                    px(10_000.),
+                    cell_width,
+                    Some(RowWindow {
+                        start_col: 100,
+                        full_len: 300,
+                    }),
+                    |_| false,
+                    &[],
+                    window,
+                    cx,
+                );
+
+                assert_eq!(layouts.len(), 1);
+                let layout = &layouts[0];
+
+                // The full row length is tracked even though only the window is shaped.
+                assert_eq!(layout.full_len, 300);
+                assert_eq!(layout.shaped_start_index, 100);
+                assert_eq!(layout.start_x(), f64::from(cell_width * 100.));
+
+                // Only the windowed columns are shaped.
+                assert_eq!(layout.shaped_len(), 100);
+
+                // Columns outside the shaped window land on the monospace grid.
+                assert_eq!(layout.x_for_index(0), 0.);
+                assert_eq!(
+                    layout.index_for_x(0.),
+                    Some(IndexForX::GridApproximation(0))
+                );
+
+                // A position inside the window maps back to (approximately) the
+                // same column (exact round-tripping depends on font glyph metrics).
+                let inside = layout.x_for_index(150);
+                let Some(IndexForX::Shaped(inside_index)) = layout.index_for_x(inside) else {
+                    panic!("expected a shaped index inside the window");
+                };
+                assert!((inside_index as isize - 150).abs() <= 1);
+
+                // The seams of the shaped window, where grid math hands off to
+                // shaped math, round-trip exactly.
+                let window_start = layout.x_for_index(100);
+                assert_eq!(window_start, layout.start_x());
+                assert_eq!(
+                    layout.index_for_x(window_start),
+                    Some(IndexForX::Shaped(100))
+                );
+                let window_end = layout.x_for_index(200);
+                assert_eq!(layout.index_for_x(window_end), Some(IndexForX::Shaped(200)));
+                assert!(layout.is_grid_positioned_index(99));
+                assert!(layout.is_grid_positioned_index(201));
+
+                // To the right of the shaped window, positions round-trip exactly
+                // on the monospace grid.
+                let right_of_window = layout.x_for_index(250);
+                assert_eq!(
+                    layout.index_for_x(right_of_window),
+                    Some(IndexForX::GridApproximation(250))
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_fully_windowed_row_keeps_shaped_width(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let editor = window.root(cx).unwrap();
+        let style = cx.update(|_, cx| editor.update(cx, |editor, cx| editor.style(cx).clone()));
+        let editor_mode = EditorMode::full();
+        let cell_width = px(10.);
+        let text = "a".repeat(100);
+
+        window
+            .update(cx, |_, window, cx| {
+                let chunks = std::iter::once(HighlightedChunk {
+                    text: &text,
+                    style: None,
+                    is_tab: false,
+                    is_inlay: false,
+                    replacement: None,
+                });
+
+                let layouts = LineWithInvisibles::from_chunks(
+                    chunks,
+                    &style,
+                    usize::MAX,
+                    1,
+                    &editor_mode,
+                    px(10_000.),
+                    cell_width,
+                    Some(RowWindow {
+                        start_col: 0,
+                        full_len: 100,
+                    }),
+                    |_| false,
+                    &[],
+                    window,
+                    cx,
+                );
+
+                assert_eq!(layouts.len(), 1);
+                let layout = &layouts[0];
+                assert_eq!(layout.full_len, 100);
+                assert_eq!(layout.shaped_start_index, 0);
+
+                // The window covers the whole row, so the width is the exact
+                // shaped width rather than the monospace-grid estimate.
+                let shaped_width = layout
+                    .fragments
+                    .iter()
+                    .map(|fragment| match fragment {
+                        LineFragment::Text(shaped) => shaped.width,
+                        LineFragment::Element { size, .. } => size.width,
+                    })
+                    .fold(Pixels::ZERO, |acc, width| acc + width);
+                assert_eq!(layout.width, ScrollPixelOffset::from(shaped_width));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_layout_line_shapes_window_of_long_rows(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let long_len = MAX_LINE_LEN * 2;
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(&"a".repeat(long_len), cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let editor = window.root(cx).unwrap();
+        let style = cx.update(|_, cx| editor.update(cx, |editor, cx| editor.style(cx).clone()));
+
+        window
+            .update(cx, |editor, window, cx| {
+                let snapshot = editor.snapshot(window, cx);
+
+                // Without a window, long rows are grid-positioned and unshaped.
+                let grid_only = layout_line(
+                    DisplayRow(0),
+                    &snapshot,
+                    &style,
+                    px(500.),
+                    None,
+                    |_| false,
+                    window,
+                    cx,
+                );
+                assert_eq!(grid_only.full_len, long_len);
+                assert_eq!(grid_only.fragments.len(), 0);
+
+                // Painting callers (e.g. sticky headers) pass a window and get
+                // shaped fragments covering it.
+                let windowed = layout_line(
+                    DisplayRow(0),
+                    &snapshot,
+                    &style,
+                    px(500.),
+                    Some(100..200),
+                    |_| false,
+                    window,
+                    cx,
+                );
+                assert_eq!(windowed.full_len, long_len);
+                assert_eq!(windowed.shaped_start_index, 100);
+                assert_eq!(windowed.shaped_len(), 100);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_soft_wrap_toggle_on_huge_line_while_scrolled(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let long_len = MAX_LINE_LEN * 100;
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(&"x".repeat(long_len), cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let editor = window.root(cx).unwrap();
+        let style = cx.update(|_, cx| editor.update(cx, |editor, cx| editor.style(cx).clone()));
+        let editor_size = size(px(500.), px(500.));
+
+        // The selection change is requested inside the draw closure so that
+        // this frame (and not an intermediate root-view draw) consumes the
+        // autoscroll request: the frame lays out lines for scroll x = 0, then
+        // horizontal autoscroll jumps to the cursor at the end of the line,
+        // which must re-shape the layouts for the final scroll position within
+        // the same frame.
+        let (_, state) = cx.draw(Default::default(), editor_size, |window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::fit()),
+                    window,
+                    cx,
+                    |s| {
+                        let end = Point::new(0, long_len as u32);
+                        s.select_ranges([end..end])
+                    },
+                );
+            });
+            EditorElement::new(&editor, style.clone())
+        });
+        let position_map = &state.position_map;
+        assert!(position_map.scroll_position.x > 0.);
+        let line = &position_map.line_layouts[0];
+        assert_eq!(line.full_len, long_len);
+        assert!(line.shaped_start_index > 0);
+        assert!(line.shaped_len() < long_len);
+        assert!(!line.is_grid_positioned_index(long_len));
+        let cursor_x = line.x_for_index(long_len);
+        assert!(cursor_x >= position_map.scroll_pixel_position.x);
+        assert!(
+            cursor_x <= position_map.scroll_pixel_position.x + f64::from(editor_size.width),
+            "cursor at the end of the line must be autoscrolled into view"
+        );
+
+        window
+            .update(cx, |editor, window, cx| {
+                editor.toggle_soft_wrap(&ToggleSoftWrap, window, cx);
+            })
+            .unwrap();
+
+        // Transitional frame: the wrap width is set, but the snapshot has no
+        // wrap transforms until the background rewrap completes.
+        cx.draw(Default::default(), editor_size, |_, _| {
+            EditorElement::new(&editor, style.clone())
+        });
+        cx.run_until_parked();
+        let (_, state) = cx.draw(Default::default(), editor_size, |_, _| {
+            EditorElement::new(&editor, style.clone())
+        });
+        assert!(state.position_map.snapshot.has_soft_wraps());
+        assert_eq!(state.position_map.scroll_position.x, 0.);
+        assert_eq!(state.position_map.scroll_max.x, 0.);
+
+        window
+            .update(cx, |editor, window, cx| {
+                editor.toggle_soft_wrap(&ToggleSoftWrap, window, cx);
+            })
+            .unwrap();
+
+        // Transitional frame in the other direction: the mode is `None`, but
+        // the snapshot still contains wrap transforms until the background
+        // unwrap completes, so per-row windowing must stay disengaged.
+        cx.draw(Default::default(), editor_size, |_, _| {
+            EditorElement::new(&editor, style.clone())
+        });
+        cx.run_until_parked();
+        let (_, state) = cx.draw(Default::default(), editor_size, |_, _| {
+            EditorElement::new(&editor, style.clone())
+        });
+        let position_map = &state.position_map;
+        assert!(!position_map.snapshot.has_soft_wraps());
+        let line = &position_map.line_layouts[0];
+        assert_eq!(line.full_len, long_len);
+        assert!(line.shaped_len() < long_len);
+    }
+
+    #[gpui::test]
+    async fn test_point_for_position_snaps_grid_columns_to_char_boundaries(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let long_chars = MAX_LINE_LEN * 2;
+        let byte_len = long_chars * 2;
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(&"α".repeat(long_chars), cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let editor = window.root(cx).unwrap();
+        let style = cx.update(|_, cx| editor.update(cx, |editor, cx| editor.style(cx).clone()));
+
+        // Requested inside the draw closure so this frame consumes the
+        // autoscroll request.
+        let (_, state) = cx.draw(
+            Default::default(),
+            size(px(500.), px(500.)),
+            |window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.change_selections(
+                        SelectionEffects::scroll(Autoscroll::fit()),
+                        window,
+                        cx,
+                        |s| {
+                            let end = Point::new(0, byte_len as u32);
+                            s.select_ranges([end..end])
+                        },
+                    );
+                });
+                EditorElement::new(&editor, style.clone())
+            },
+        );
+        let position_map = &state.position_map;
+        let line = &position_map.line_layouts[0];
+        assert!(line.shaped_start_index > 0);
+        // The shaped window starts on a character boundary; "α" is 2 bytes, so
+        // grid columns at odd offsets fall inside a character.
+        assert_eq!(line.shaped_start_index % 2, 0);
+        let odd_column = line.shaped_start_index - 51;
+
+        // A drag position left of the shaped window (e.g. selecting leftwards
+        // on a scrolled huge line) maps onto the monospace grid.
+        let target_x = odd_column as f64 * f64::from(position_map.em_layout_width);
+        let position = gpui::point(
+            position_map.text_hitbox.bounds.origin.x
+                + Pixels::from(target_x - position_map.scroll_pixel_position.x),
+            position_map.text_hitbox.bounds.origin.y + px(1.),
+        );
+        let point_for_position = position_map.point_for_position(position);
+
+        // The raw grid column splits the character; it must be snapped to the
+        // character's start so downstream offset conversions stay valid.
+        assert_eq!(
+            point_for_position.exact_unclipped,
+            DisplayPoint::new(DisplayRow(0), odd_column as u32 - 1)
+        );
+        assert_eq!(
+            point_for_position.previous_valid,
+            DisplayPoint::new(DisplayRow(0), odd_column as u32 - 1)
+        );
     }
 
     #[gpui::test]
@@ -12488,18 +13281,23 @@ mod tests {
     }
 
     #[test]
+    fn test_byte_columns_to_shape() {
+        assert_eq!(byte_columns_to_shape(0., 100), 0..400);
+        assert_eq!(byte_columns_to_shape(99.9, 100), 0..400);
+        assert_eq!(byte_columns_to_shape(100., 100), 0..400);
+        assert_eq!(byte_columns_to_shape(200., 100), 100..500);
+        assert_eq!(byte_columns_to_shape(-5., 100), 0..400);
+        assert_eq!(byte_columns_to_shape(1_000_000., 100), 999_900..1_000_300);
+    }
+
+    #[test]
     fn test_calculate_wrap_width() {
         let editor_width = px(800.0);
         let em_width = px(8.0);
 
         assert_eq!(
-            calculate_wrap_width(SoftWrap::GitDiff, editor_width, em_width),
-            None,
-        );
-
-        assert_eq!(
             calculate_wrap_width(SoftWrap::None, editor_width, em_width),
-            Some(px((MAX_LINE_LEN as f32 / 2.0 * 8.0).ceil())),
+            None,
         );
 
         assert_eq!(
