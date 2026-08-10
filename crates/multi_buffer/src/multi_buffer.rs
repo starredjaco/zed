@@ -3130,7 +3130,7 @@ impl MultiBuffer {
     }
 }
 
-fn build_excerpt_ranges(
+pub fn build_excerpt_ranges(
     ranges: impl IntoIterator<Item = Range<Point>>,
     context_line_count: u32,
     buffer_snapshot: &BufferSnapshot,

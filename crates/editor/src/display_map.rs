@@ -1370,7 +1370,6 @@ impl DisplayMap {
         }
     }
 
-    #[cfg(test)]
     pub fn is_rewrapping(&self, cx: &gpui::App) -> bool {
         self.wrap_map.read(cx).is_rewrapping()
     }
